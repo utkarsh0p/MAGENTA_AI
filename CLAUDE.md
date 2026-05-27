@@ -11,7 +11,7 @@ HumanTouch is a multi-tenant agentic SaaS platform with three actor types:
 
 1. **Admin (CEO)** — creates agents, assigns them to employees, chats with a supervisor agent that wraps all created agents as tools and can spawn new agents dynamically.
 2. **Employee** — sees only assigned agents, chats with each independently with full persistent memory per conversation.
-3. **Supervisor Agent** — admin's top-level agent; rebuilt from DB on every invoke, never cached.
+3. **Supervisor Agent** — admin's top-level agent; cached per organization, rebuilt only when agents change.
 
 Two separate services:
 
@@ -76,7 +76,7 @@ lib/api-client.ts               # typed fetch; attaches Authorization: Bearer to
 agents/
   factory/
     agentFactory.ts             # builds agent from AgentConfig; never cache instances
-    supervisorFactory.ts        # rebuilds supervisor from DB on every admin invoke
+    supervisorFactory.ts        # caches supervisor per org; rebuilds only when agents change
     spawnAgent.ts               # spawn_agent tool logic + depth/persist guards
   tools/
     composioClient.ts           # single ComposioToolSet singleton
@@ -119,6 +119,34 @@ Output: { agent: CompiledStateGraph, threadId: string }
 5. threadId = supervisor_{organizationId}_{adminId}
 ```
 
+**Supervisor Caching**
+
+Supervisor is cached per organization. On every admin invoke:
+
+```
+check supervisorCache for organizationId
+  → compare cache.builtAt vs org.agentsUpdatedAt
+  → builtAt >= agentsUpdatedAt  → use cached supervisor
+  → builtAt <  agentsUpdatedAt  → rebuild + update cache
+```
+
+Cache lives in a module-level Map in `supervisorFactory.ts`:
+
+```typescript
+const supervisorCache = new Map<string, { supervisor: any, builtAt: Date }>()
+```
+
+Whenever any agent is created, updated, or deleted — always update the timestamp:
+
+```typescript
+await db.organization.update({
+  where: { id: organizationId },
+  data: { agentsUpdatedAt: new Date() }
+})
+```
+
+Multiple orgs never share a supervisor instance — cache is keyed by `organizationId`.
+
 **spawnAgent Tool** (`agents/factory/spawnAgent.ts`)
 
 ```
@@ -152,7 +180,7 @@ Guards:
 ### Database Schema
 
 ```prisma
-model Organization { id, name, users[], agents[] }
+model Organization { id, name, users[], agents[], agentsUpdatedAt DateTime @default(now()) }
 
 model User { id, email, name, role (ADMIN|EMPLOYEE), organizationId,
              assignments[], conversations[] }
@@ -185,7 +213,7 @@ JWT middleware extracts `organizationId` → `req.org`. Every DB query must filt
 2. Never implement OAuth or API wrappers for third-party services — always use Composio.
 3. Every DB query must be scoped by `organizationId`.
 4. Never reuse a `threadId` across users or across STANDALONE/SUPERVISOR_CALL modes.
-5. Supervisor toolset is always rebuilt from DB on every invoke — never cache it.
+5. Supervisor is cached per org and rebuilt only when `agentsUpdatedAt` advances — always update `agentsUpdatedAt` on any agent create/update/delete.
 6. Enforce `spawnDepth` and `persist` rules strictly inside `spawnAgent.ts`.
 7. All agent responses stream via SSE — never wait for full completion.
 8. Admin routes must never be accessible to employees and vice versa.
