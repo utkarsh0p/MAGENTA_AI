@@ -7,18 +7,36 @@ See [`CODING_STYLE.md`](./CODING_STYLE.md) for the full coding style guide. Key 
 
 ## Project Overview
 
-HumanTouch is a multi-tenant agentic SaaS platform with three actor types:
+**HumanTouch** is a multi-tenant agentic SaaS platform where every organization gets a **Main Agent** (their AI chief-of-staff) backed by **10 pre-built Sub Agents** (specialists). The admin can chat with the Main Agent (which orchestrates Sub Agents as tools) or chat directly with any Sub Agent independently.
 
-1. **Admin (CEO)** — creates agents, assigns them to employees, chats with a supervisor agent that wraps all created agents as tools and can spawn new agents dynamically.
-2. **Employee** — sees only assigned agents, chats with each independently with full persistent memory per conversation.
-3. **Supervisor Agent** — admin's top-level agent; cached per organization, rebuilt only when agents change.
+**Primary user:** Solo founders and freelancers — one person running a business who wants an AI team to handle specialist work they can't hire for yet.
+
+### Subscription Tiers
+
+| Tier | What's included |
+|---|---|
+| **Free (current build)** | Main Agent + 10 pre-built Sub Agents, all managed by the admin |
+| **Enterprise (future)** | Custom agent creation, role-specific agents assigned to individual employees |
+
+Everything described in this file is the **free tier only**. Do not implement enterprise features.
+
+### Actor Types
+
+1. **Admin** — the organization owner. Completes onboarding, then chats with the Main Agent or directly with any Sub Agent.
+2. **Main Agent** — the org's top-level AI. Orchestrates all Sub Agents as tools. Cached per org.
+3. **Sub Agents (10 pre-built)** — specialist agents. Stateless when used as Main Agent tools. Persistent (checkpointer + threadId) when chatted with directly by the admin.
+4. **Reflexive Agent** — a stateless, ephemeral agent used to generate system prompts through conversation. Never stored in DB. Used during onboarding only.
+
+---
 
 Two separate services:
 
 | Service | Path | Stack |
 |---|---|---|
-| Frontend | `frontend/` | Next.js 14+ (App Router), NextAuth.js v5, TypeScript |
+| Frontend | `frontend/` | Next.js 14+ (App Router), TypeScript |
 | Backend | `backend/` | Node.js, TypeScript, LangGraph.js, Express, Prisma, PostgreSQL |
+
+Auth: email + password, backend issues JWT, frontend stores in httpOnly cookie. No NextAuth.
 
 ---
 
@@ -56,18 +74,16 @@ pnpm db:studio
 
 ```
 app/
-  (auth)/sign-in, sign-up
+  (auth)/
+    sign-in/
+    sign-up/
+  onboarding/                     # first-login flow; reflexive agent chat to set up Main Agent
   (admin)/
-    dashboard/
-    agents/new, [agentId]/      # 4-step agent creation form
-    employees/[employeeId]/
-    chat/                       # supervisor chat + SSE stream
-  (employee)/
-    agents/[agentId]/[conversationId]/
-  api/auth/                     # NextAuth [...nextauth] handler
-auth.ts                         # NextAuth config; JWT contains userId, organizationId, role
-middleware.ts                   # guards /admin routes for ADMIN, /employee for EMPLOYEE
-lib/api-client.ts               # typed fetch; attaches Authorization: Bearer token
+    dashboard/                    # main view: agent network graph + chat + live logs
+lib/
+  api-client.ts                   # typed fetch wrapper; attaches Authorization: Bearer token
+  auth.ts                         # JWT helpers: store/retrieve token from cookie, decode user
+middleware.ts                     # reads JWT cookie; redirect to /onboarding if not onboarded; guard /admin
 ```
 
 ### Backend (`backend/src/`)
@@ -75,172 +91,350 @@ lib/api-client.ts               # typed fetch; attaches Authorization: Bearer to
 ```
 agents/
   factory/
-    agentFactory.ts             # builds agent from AgentConfig; never cache instances
-    supervisorFactory.ts        # caches supervisor per org; rebuilds only when agents change
-    spawnAgent.ts               # spawn_agent tool logic + depth/persist guards
+    mainAgentFactory.ts           # builds Main Agent; attaches all Sub Agents as tools; caches per org
+    subAgentFactory.ts            # buildSubAgent (tool mode or direct-chat mode); buildDirectSubAgent; cache
+  prebuilt/
+    templates/                    # one file per sub agent type (hrTemplate.ts, salesTemplate.ts, …)
+    registry.ts                   # PREBUILT_AGENTS map: type → template
+  reflexive/
+    reflexiveAgent.ts             # ephemeral createReactAgent for generating system prompts
+    onboardingFlow.ts             # orchestrates onboarding question sequence via reflexive agent
   tools/
-    composioClient.ts           # single ComposioToolSet singleton
-    toolRegistry.ts             # SPAWNABLE_ACTIONS whitelist
-graphs/
-  agentGraph.ts                 # generic ReAct agent graph template
-  supervisorGraph.ts            # supervisor StateGraph; routes tasks to sub-agent nodes
+    composioClient.ts             # single ComposioToolSet singleton
+    toolRegistry.ts               # Composio action lists per sub agent type
 api/
-  routes/                       # agents, employees, conversations, messages, tasks
-  middleware/auth.ts            # JWT verify; attaches req.org.organizationId
-  middleware/orgScope.ts        # all queries filtered by organizationId
-db/client.ts                    # Prisma singleton
-prisma/schema.prisma            # source of truth
+  routes/
+    agents.ts                     # GET /api/agents — list all AgentConfigs for org
+    conversations.ts              # conversations + messages + SSE stream routes
+    onboarding.ts                 # onboarding flow routes
+    auth.ts                       # POST /api/auth/register, POST /api/auth/login
+  middleware/
+    auth.ts                       # JWT verify; attaches req.user + req.org
+    orgScope.ts                   # all queries filtered by organizationId
+db/client.ts                      # Prisma singleton
+prisma/schema.prisma              # source of truth
 ```
 
-### LangGraph Agent System
+---
 
-**AgentFactory** (`agents/factory/agentFactory.ts`)
+## Auth
+
+Backend issues a signed JWT (HS256) containing `{ userId, organizationId, role }` on successful login. Frontend stores it in an httpOnly cookie. All backend routes (except `/api/auth/*` and `/api/onboarding/status`) require `Authorization: Bearer <token>` or the cookie.
+
+`lib/auth.ts` (frontend) exposes helpers: `getToken()`, `setToken()`, `clearToken()`, `decodeUser()`. `lib/api-client.ts` reads the token and attaches it to every request. `middleware.ts` reads the cookie to protect admin routes server-side.
+
+---
+
+## Onboarding Flow
+
+Triggered on first login when `org.onboardingCompleted = false`. Admin is redirected to `/onboarding`.
 
 ```
-Input:  AgentConfig + User + checkpointer + mode (STANDALONE | SUPERVISOR_CALL)
+1. Frontend opens SSE stream to GET /api/onboarding/stream
+2. Reflexive Agent (ONBOARDING mode) asks questions about the org:
+     - Company name, industry, size
+     - Admin's role and responsibilities
+     - Primary goals for the AI agent
+     - Tone/personality preferences
+3. Admin answers via POST /api/onboarding/message
+4. Reflexive Agent generates:
+     a. Main Agent system prompt (rich, org-specific)
+     b. Org context object { companyName, industry, size, adminRole, goals, tone }
+5. POST /api/onboarding/complete:
+     - Creates Main AgentConfig in DB with generated system prompt
+     - Creates all 10 Sub AgentConfigs in DB — each template's placeholders filled with org context
+     - Sets org.onboardingCompleted = true, org.agentsUpdatedAt = now()
+6. Admin redirected to /admin/dashboard
+```
+
+The Reflexive Agent is never stored. It runs ephemeral, no checkpointer, no DB record.
+
+### Onboarding UX Shape
+
+The onboarding page is a **guided wizard with embedded chat** — not a plain form and not a freeform chat.
+
+```
+Structure:
+- Progress bar at top showing current step (e.g. "Step 2 of 4 — Your Role")
+- Each step has a defined topic: Company → Role → Goals → Tone/Personality
+- Within each step, the Reflexive Agent drives the conversation:
+    → asks a focused question for that step
+    → user replies freely
+    → agent may ask 1 follow-up if needed
+    → step marked complete, move to next
+- Final step: Reflexive Agent summarizes what it understood and asks for confirmation
+- On confirm → POST /api/onboarding/complete
+```
+
+---
+
+## Reflexive Agent
+
+`agents/reflexive/reflexiveAgent.ts`
+
+A `createReactAgent` instance with a meta-prompt instructing it to:
+- Ask targeted questions to understand context
+- Synthesize answers into a well-structured system prompt
+- Return the generated prompt as its final message
+
+Two modes passed via system prompt variant:
+
+| Mode | Purpose | Output |
+|---|---|---|
+| `ONBOARDING` | Full org context gathering | Main Agent system prompt |
+| `SUBAGENT_CONTEXT` | Fill placeholders for one sub agent type | Filled sub-agent system prompt |
+
+No tools. No checkpointer. Fresh uuid threadId every invocation.
+
+---
+
+## Pre-built Sub Agents
+
+10 sub agents provisioned for every org during onboarding. Each is stored as an `AgentConfig` with `agentType = SUBAGENT` and a `prebuiltType` enum.
+
+All sub agents are connected to the Main Agent as tools. Main Agent tool name = sub agent `prebuiltType` in lowercase (e.g. `hr_agent`, `sales_agent`).
+
+| # | prebuiltType | Responsibility | Composio Tools |
+|---|---|---|---|
+| 1 | `HR` | Screen resumes, schedule interviews, send offer letters, onboard employees, answer HR FAQs | Email, Calendar, Google Drive |
+| 2 | `CUSTOMER_SUPPORT` | Answer tickets, resolve FAQs, escalate edge cases, draft responses, track issue status | Email, Zendesk/Freshdesk, CRM |
+| 3 | `SALES` | Research leads, send cold emails, follow up, update CRM after interactions | Gmail, LinkedIn, HubSpot/Salesforce, Web Search |
+| 4 | `FINANCE` | Generate invoices, track expenses, send payment reminders, summarize spend reports | Email, Notion/Sheets, QuickBooks |
+| 5 | `DATA` | Pull data, generate weekly/monthly reports, alert on anomalies or KPI drops | SQL, Google Sheets, Slack |
+| 6 | `OPERATIONS` | Manage calendars, book meetings, send reminders, coordinate between departments | Google Calendar, Email, Slack, Notion |
+| 7 | `MARKETING` | Draft social posts, blogs, email campaigns, schedule and publish content | Buffer/Hootsuite, CMS, Email |
+| 8 | `IT` | Reset passwords, provision/deprovision accounts, troubleshoot common issues | Jira, Slack, Internal APIs |
+| 9 | `LEGAL` | Review standard contracts, flag risky clauses, track compliance deadlines | Document parser, Email, Calendar |
+| 10 | `EXECUTIVE_ASSISTANT` | Summarize emails, prep meeting briefs, take notes, draft responses for leadership | Gmail, Calendar, Notion, Slack |
+
+### Template System Prompt Structure
+
+Each template in `agents/prebuilt/templates/` has:
+
+```typescript
+export const hrTemplate = {
+  name: 'HR Agent',
+  prebuiltType: 'HR',
+  description: '...',
+  systemPromptTemplate: `
+    You are the HR agent for {{companyName}}, a {{industry}} company.
+    Your role: ...
+    Company size: {{companySize}}
+    Key responsibilities: ...
+  `,
+  composioActions: ['GMAIL_SEND_EMAIL', 'GOOGLECALENDAR_CREATE_EVENT', ...]
+}
+```
+
+Placeholders: `{{companyName}}`, `{{industry}}`, `{{companySize}}`, `{{adminRole}}`, `{{goals}}`, `{{tone}}`.
+
+---
+
+## LangGraph Agent System
+
+### MainAgentFactory (`agents/factory/mainAgentFactory.ts`)
+
+```
+Input:  orgId + adminUserId + checkpointer
 Output: { agent: CompiledStateGraph, threadId: string }
 
-1. composio.getTools({ actions: config.tools, entityId: user.id })
-2. system prompt = config.systemPrompt + employee context (name, role)
-3. if config.canSpawn → add spawn_agent tool
-4. createReactAgent({ model, tools, prompt, checkpointer })
-5. threadId:
-     STANDALONE:        agent_{agentId}_emp_{userId}
-     SUPERVISOR_CALL:   supervisor_call_{agentId}_emp_{userId}_{uuid}
+1. Check mainAgentCache — if builtAt >= org.agentsUpdatedAt, return cached agent
+2. Load Main AgentConfig WHERE organizationId = orgId AND agentType = MAIN
+3. Load all Sub AgentConfigs WHERE organizationId = orgId AND agentType = SUBAGENT
+4. For each sub agent config:
+     a. composio.getTools({ actions: config.composioActions, entityId: adminUserId })
+     b. subAgent = buildSubAgent({ config, tools })   ← no checkpointer = stateless tool mode
+     c. wrap subAgent as a LangChain tool: name = config.prebuiltType.toLowerCase() + '_agent'
+5. composio.getTools({ actions: mainConfig.composioActions, entityId: adminUserId })
+6. allTools = [...mainTools, ...subAgentTools]
+7. agent = createReactAgent({ model: gemini-2.5-pro, tools: allTools, prompt: mainConfig.systemPrompt, checkpointer })
+8. Update mainAgentCache: { agent, builtAt: now() }
+9. threadId = main_{organizationId}_{adminUserId}
 ```
 
-**SupervisorFactory** (`agents/factory/supervisorFactory.ts`)
+### SubAgentFactory (`agents/factory/subAgentFactory.ts`)
 
+Two exported functions:
+
+**`buildSubAgent`** — used by `MainAgentFactory` to build stateless sub-agent tools:
 ```
-1. Pull all AgentConfigs WHERE org = admin.org AND isTopLevel = false
-2. Each config → tool (name = config.name, description = config.description, handler = AgentFactory)
-3. Add spawn_agent tool
-4. createReactAgent(...)
-5. threadId = supervisor_{organizationId}_{adminId}
-```
+Input:  AgentConfig + Composio tools + optional checkpointer
+Output: CompiledStateGraph
 
-**Supervisor Caching**
-
-Supervisor is cached per organization. On every admin invoke:
-
-```
-check supervisorCache for organizationId
-  → compare cache.builtAt vs org.agentsUpdatedAt
-  → builtAt >= agentsUpdatedAt  → use cached supervisor
-  → builtAt <  agentsUpdatedAt  → rebuild + update cache
+createReactAgent({ model, tools, prompt: config.systemPrompt, ...checkpointer if provided })
 ```
 
-Cache lives in a module-level Map in `supervisorFactory.ts`:
+**`buildDirectSubAgent`** — used by the stream route for direct admin↔sub-agent chat:
+```
+Input:  AgentConfig + adminUserId + checkpointer + composio + org
+Output: { agent: CompiledStateGraph, threadId: string }
 
-```typescript
-const supervisorCache = new Map<string, { supervisor: any, builtAt: Date }>()
+1. Check directSubAgentCache (keyed by orgId:prebuiltType) — return if builtAt >= org.agentsUpdatedAt
+2. composio.getTools({ actions: config.composioActions, entityId: adminUserId })
+3. agent = buildSubAgent({ config, tools, checkpointer })
+4. Update directSubAgentCache
+5. threadId = getSubAgentThreadId(prebuiltType, orgId, userId)
 ```
 
-Whenever any agent is created, updated, or deleted — always update the timestamp:
+**`getSubAgentThreadId(prebuiltType, orgId, userId)`** — pure helper, exported. Always use this; never inline the format string.
 
-```typescript
-await db.organization.update({
-  where: { id: organizationId },
-  data: { agentsUpdatedAt: new Date() }
-})
-```
-
-Multiple orgs never share a supervisor instance — cache is keyed by `organizationId`.
-
-**spawnAgent Tool** (`agents/factory/spawnAgent.ts`)
+### Caching
 
 ```
-Input: name, description, systemPrompt, task, allowedActions[], persist?
+mainAgentCache:        Map<orgId, { agent, builtAt }>
+directSubAgentCache:   Map<"orgId:prebuiltType", { agent, builtAt }>
 
-Guards:
-- allowedActions ⊆ SPAWNABLE_ACTIONS whitelist
-- caller spawnDepth < MAX_SPAWN_DEPTH (2)
-- persist=true only when caller isTopLevel=true
-
-1. Build ephemeral agent, no checkpointer, fresh uuid threadId
-2. Invoke with task
-3. If persist=true → insert AgentConfig with spawnedBy = caller agentId
-4. Return result string
+Both caches invalidate when builtAt < org.agentsUpdatedAt.
+Always bump org.agentsUpdatedAt on any AgentConfig create/update/delete.
 ```
 
-**Spawn Permission Matrix**
+### Chat UX — Sub Agent Transparency (Main Agent mode)
 
-| Caller           | canSpawn | Can Persist | Max Depth |
-|------------------|----------|-------------|-----------|
-| Admin Supervisor | Yes      | Yes         | 2         |
-| Employee Agent   | Yes      | No          | 1         |
-| Spawned Agent    | No       | No          | 0         |
+When the Main Agent delegates to a Sub Agent, the SSE stream emits attribution events:
 
-**Composio** (`agents/tools/composioClient.ts`): single `ComposioToolSet` singleton. Tools always fetched with `entityId = userId` so every call uses that user's OAuth tokens. OAuth onboarding is triggered via `POST /api/composio/onboard` when an agent is assigned to an employee — never implement OAuth manually for any third-party service.
+```
+[HR Agent is working on this…]
+← streaming response from HR Agent →
+[Main Agent] Here's what the HR Agent found: …
+```
 
-**Checkpointing**: `@langchain/langgraph-checkpoint-postgres`. Passing the same `threadId` to `agent.invoke()` restores full conversation memory. STANDALONE and SUPERVISOR_CALL threadIds use different patterns — never mix them.
+### Dashboard Layout
 
-**Streaming**: `GET /api/conversations/:id/stream` is SSE. LangGraph `streamEvents()` feeds tokens directly into the SSE response. Frontend reads via `EventSource`.
+Single main page at `/admin/dashboard`. Intended UX: graphical view of the agent network (Main Agent + connected Sub Agents as nodes), chat panel, and live activity log showing which agents are active and message flow. Exact UI implementation to be defined during frontend build.
 
-### Database Schema
+### Composio
+
+`agents/tools/composioClient.ts`: single `ComposioToolSet` singleton. Tools always fetched with `entityId = userId`. **Lazy OAuth** — do not require tool connections during onboarding. Sub agents go live immediately. If a sub agent attempts a Composio action and the user has not connected that tool, catch the Composio `NotConnected` error and emit a message to the chat: "To use [tool], you need to connect your [app] account. [Connect now →]" which triggers `POST /api/composio/onboard`. Never implement OAuth manually.
+
+### Checkpointing
+
+`@langchain/langgraph-checkpoint-postgres`. Used by the Main Agent and by Sub Agents in direct-chat mode. Same `threadId` = persistent memory across sessions. Sub agents in tool mode and the Reflexive Agent are stateless (no checkpointer).
+
+### Streaming
+
+`GET /api/conversations/:id/stream` is SSE. LangGraph `streamEvents()` feeds tokens directly into the SSE response. Frontend reads via `EventSource`. Onboarding also streams via `GET /api/onboarding/stream`.
+
+### SSE Event Types
+
+| Event | When |
+|---|---|
+| `main_token` | Main Agent generating tokens |
+| `subagent_start` | Main Agent delegating to a Sub Agent (includes name + prebuiltType) |
+| `subagent_token` | Sub Agent tokens during Main Agent orchestration |
+| `subagent_direct_token` | Admin chatting directly with a Sub Agent |
+| `error` | Tool not connected or fatal error |
+
+---
+
+## Database Schema
 
 ```prisma
-model Organization { id, name, users[], agents[], agentsUpdatedAt DateTime @default(now()) }
+enum Role        { ADMIN }
+enum AgentType   { MAIN SUBAGENT }
+enum PrebuiltType { HR CUSTOMER_SUPPORT SALES FINANCE DATA OPERATIONS MARKETING IT LEGAL EXECUTIVE_ASSISTANT }
 
-model User { id, email, name, role (ADMIN|EMPLOYEE), organizationId,
-             assignments[], conversations[] }
+model Organization {
+  id                  String        @id @default(cuid())
+  name                String
+  onboardingCompleted Boolean       @default(false)
+  orgContext          Json?         // { companyName, industry, companySize, adminRole, goals, tone }
+  agentsUpdatedAt     DateTime      @default(now())
+  users               User[]
+  agents              AgentConfig[]
+  conversations       Conversation[]
+}
 
-model AgentConfig { id, name, description, systemPrompt, tools[], apps[],
-                    capabilities[], isTopLevel, canSpawn, spawnedBy?,
-                    isEphemeral, spawnDepth, organizationId,
-                    assignments[], conversations[], tasks[] }
+model User {
+  id             String         @id @default(cuid())
+  email          String         @unique
+  passwordHash   String
+  name           String
+  role           Role           @default(ADMIN)
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  conversations  Conversation[]
+}
 
-model AgentAssignment { userId, agentId  @@unique([userId, agentId]) }
+model AgentConfig {
+  id              String         @id @default(cuid())
+  name            String
+  description     String
+  systemPrompt    String
+  composioActions String[]
+  agentType       AgentType
+  prebuiltType    PrebuiltType?  // null for MAIN agent
+  organizationId  String
+  organization    Organization   @relation(fields: [organizationId], references: [id])
+  conversations   Conversation[]
+}
 
-model Conversation { id, userId, agentId, threadId (unique), title?,
-                     mode (STANDALONE|SUPERVISOR_CALL), messages[] }
+model Conversation {
+  id             String       @id @default(cuid())
+  userId         String
+  agentId        String
+  organizationId String
+  threadId       String       @unique
+  title          String?
+  user           User         @relation(fields: [userId], references: [id])
+  agentConfig    AgentConfig  @relation(fields: [agentId], references: [id])
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  messages       Message[]
+}
 
-model Message { id, conversationId, role, content, createdAt }
-
-model Task { id, agentId, assignedBy, description,
-             status (PENDING|RUNNING|DONE|FAILED), result? }
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  role           String       // user | assistant | tool_result
+  content        String
+  createdAt      DateTime     @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+}
 ```
 
-### Multi-Tenancy
+---
 
-JWT middleware extracts `organizationId` → `req.org`. Every DB query must filter by `organizationId`. Agents, employees, and conversations from one org are never visible to another.
+## Multi-Tenancy
+
+JWT middleware extracts `organizationId` → `req.org`. Every DB query must filter by `organizationId`. Orgs are fully isolated — agents, conversations, and context from one org are never visible to another.
 
 ---
 
 ## Key Invariants
 
-1. Agent behavior is never hardcoded — everything comes from `AgentConfig` in DB.
+1. Agent behavior is never hardcoded — system prompts always come from `AgentConfig.systemPrompt` in DB.
 2. Never implement OAuth or API wrappers for third-party services — always use Composio.
 3. Every DB query must be scoped by `organizationId`.
-4. Never reuse a `threadId` across users or across STANDALONE/SUPERVISOR_CALL modes.
-5. Supervisor is cached per org and rebuilt only when `agentsUpdatedAt` advances — always update `agentsUpdatedAt` on any agent create/update/delete.
-6. Enforce `spawnDepth` and `persist` rules strictly inside `spawnAgent.ts`.
-7. All agent responses stream via SSE — never wait for full completion.
-8. Admin routes must never be accessible to employees and vice versa.
+4. Never reuse a `threadId` across users or sessions.
+5. Main Agent and direct sub-agent instances are cached per org — always bump `agentsUpdatedAt` on any AgentConfig create/update/delete.
+6. Sub agents used as Main Agent tools are stateless (no checkpointer). Sub agents in direct-chat mode have a checkpointer and persistent threadId.
+7. Reflexive Agent is always ephemeral — never stored in DB, no checkpointer.
+8. All agent responses stream via SSE — never wait for full completion.
+9. Onboarding must complete before any chat is accessible — enforce in middleware.
+10. The free tier has no employee-facing features — do not implement enterprise features.
+11. Always use `getSubAgentThreadId(prebuiltType, orgId, userId)` to construct sub-agent threadIds — never inline the format string.
 
 ---
 
 ## API Routes
 
 ```
-POST /api/auth/login, /api/auth/register
+POST /api/auth/register             # { name, email, password, orgName } → { token }
+POST /api/auth/login                # { email, password } → { token }
 
-GET|POST        /api/agents
-GET|PUT|DELETE  /api/agents/:agentId
+GET  /api/onboarding/status         # { completed: boolean }
+GET  /api/onboarding/stream         # SSE: reflexive agent onboarding chat
+POST /api/onboarding/message        # send message to reflexive agent
+POST /api/onboarding/complete       # finalize: creates Main + Sub AgentConfigs
 
-GET|POST        /api/employees
-GET             /api/employees/:userId
-POST|DELETE     /api/employees/:userId/assign[/:agentId]
+GET  /api/agents                    # list all AgentConfigs for org (id, name, description, agentType, prebuiltType)
 
-GET|POST        /api/conversations
-GET             /api/conversations/:id/messages
-POST            /api/conversations/:id/messages
-GET             /api/conversations/:id/stream   (SSE)
+GET  /api/conversations             # list conversations for user
+POST /api/conversations             # get-or-create conversation; body: { agentId?, title? }
+GET  /api/conversations/:id/messages
+POST /api/conversations/:id/messages
+GET  /api/conversations/:id/stream  # SSE
 
-GET             /api/tasks
-GET             /api/tasks/:taskId
-
-POST            /api/composio/onboard
-GET             /api/composio/callback
-GET             /api/composio/status/:userId
+POST /api/composio/onboard
+GET  /api/composio/callback
+GET  /api/composio/status/:userId
 ```
