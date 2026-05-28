@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-base: #0a0a0f;
+  --bg-surface: #111118;
+  --bg-elevated: #16161f;
+  --border: rgba(255, 255, 255, 0.07);
+  --text-primary: #e8e8f0;
+  --text-secondary: rgba(232, 232, 240, 0.5);
+  --text-muted: rgba(232, 232, 240, 0.25);
+  --accent: #7c5cfc;
+  --accent-dim: rgba(124, 92, 252, 0.15);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+}
+
+* {
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(124, 92, 252, 0.35));
+  }
+  50% {
+    filter: drop-shadow(0 0 16px rgba(124, 92, 252, 0.65));
+  }
+}
+
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.slide-up {
+  animation: slide-up 0.15s ease-out forwards;
+}
+
+@keyframes flow-line {
+  0% { stroke-dashoffset: 20; }
+  100% { stroke-dashoffset: 0; }
+}
+
+.flow-line {
+  animation: flow-line 0.6s linear infinite;
+}

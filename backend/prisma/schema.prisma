@@ -1,0 +1,80 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+}
+
+enum AgentType {
+  MAIN
+  SUBAGENT
+}
+
+enum PrebuiltType {
+  HR
+  SOCIAL_MEDIA_MANAGER
+  SOFTWARE_ENGINEER
+  UI_UX_DESIGNER
+}
+
+model Organization {
+  id                  String        @id @default(cuid())
+  name                String
+  onboardingCompleted Boolean       @default(false)
+  orgContext          Json?
+  agentsUpdatedAt     DateTime      @default(now())
+  users               User[]
+  agents              AgentConfig[]
+  conversations       Conversation[]
+}
+
+model User {
+  id             String         @id
+  email          String         @unique
+  name           String
+  role           Role           @default(ADMIN)
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  conversations  Conversation[]
+}
+
+model AgentConfig {
+  id              String         @id @default(cuid())
+  name            String
+  description     String
+  systemPrompt    String
+  toolkits        String[]
+  agentType       AgentType
+  prebuiltType    PrebuiltType?
+  organizationId  String
+  organization    Organization   @relation(fields: [organizationId], references: [id])
+  conversations   Conversation[]
+}
+
+model Conversation {
+  id             String       @id @default(cuid())
+  userId         String
+  agentId        String
+  organizationId String
+  threadId       String       @unique
+  title          String?
+  user           User         @relation(fields: [userId], references: [id])
+  agentConfig    AgentConfig  @relation(fields: [agentId], references: [id])
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  messages       Message[]
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  role           String
+  content        String
+  createdAt      DateTime     @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+}
